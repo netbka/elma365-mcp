@@ -13,11 +13,15 @@ export function getToken(): string {
   return token;
 }
 
-function getBaseUrl(): string {
+/** Resolve ELMA365_DOMAIN to a full origin, e.g. "mycompany" -> "https://mycompany.elma365.ru", or a self-hosted domain used as-is. */
+export function getHostUrl(): string {
   const domain = getDomain();
-  // Support both "mycompany" and "mycompany.elma365.ru"
   const host = domain.includes(".") ? domain : `${domain}.elma365.ru`;
-  return `https://${host}/pub/v1`;
+  return `https://${host}`;
+}
+
+function getBaseUrl(): string {
+  return `${getHostUrl()}/pub/v1`;
 }
 
 export function getExtensionsUrl(): string {

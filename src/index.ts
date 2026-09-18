@@ -7,9 +7,17 @@ import { getTasksSchema, handleGetTasks } from "./tools/tasks.js";
 import { getProcessesSchema, handleGetProcesses, startProcessSchema, handleStartProcess } from "./tools/processes.js";
 import { getUsersSchema, handleGetUsers, getUserByIdSchema, handleGetUserById } from "./tools/users.js";
 import { getCommentsSchema, handleGetComments, addCommentSchema, handleAddComment } from "./tools/comments.js";
+import {
+  getWidgetSchema,
+  handleGetWidget,
+  getWidgetHistorySchema,
+  handleGetWidgetHistory,
+  setWidgetScriptSchema,
+  handleSetWidgetScript,
+} from "./tools/designer.js";
 import { startHttpTransport } from "./transport/http.js";
 
-const TOOL_COUNT = 8;
+const TOOL_COUNT = 12;
 
 export function createServer(): McpServer {
   const server = new McpServer({
@@ -85,6 +93,28 @@ export function createServer(): McpServer {
     async (params) => ({ content: [{ type: "text", text: await handleAddComment(params) }] }),
   );
 
+  // --- Designer (widget script push, via headless browser) ---
+  server.tool(
+    "get_widget",
+    "Прочитать текущее состояние виджета/формы в App Designer: version, draft, clientScripts/serverScripts. Требует ELMA365_DESIGNER_EMAIL/PASSWORD (отдельная авторизация от Bearer-токена, через реальную сессию Дизайнера).",
+    getWidgetSchema.shape,
+    async (params) => ({ content: [{ type: "text", text: await handleGetWidget(params) }] }),
+  );
+
+  server.tool(
+    "get_widget_history",
+    "Получить историю публикаций виджета/формы (версии, время, автор, комментарий).",
+    getWidgetHistorySchema.shape,
+    async (params) => ({ content: [{ type: "text", text: await handleGetWidgetHistory(params) }] }),
+  );
+
+  server.tool(
+    "set_widget_script",
+    "Применить локальную правку скрипта (например, из descriptor.clientScripts экспорта elma365pm) к виджету/форме через App Designer: вставка, Сохранить, Проверить и (по умолчанию) Опубликовать. Единственный подтверждённо рабочий способ применить правку скрипта сегодня — elma365pm import/check не работает для EXTENSION-модулей с человекочитаемым кодом, а прямой PUT /api/widgets/{id} требует живой сессионный JWT и lock-hash, которые этот инструмент намеренно не извлекает для повторного использования вне Дизайнера.",
+    setWidgetScriptSchema.shape,
+    async (params) => ({ content: [{ type: "text", text: await handleSetWidgetScript(params) }] }),
+  );
+
   return server;
 }
 
@@ -101,7 +131,11 @@ async function main() {
   } else {
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error(`[elma365-mcp] Сервер запущен (stdio). ${TOOL_COUNT + 1} инструментов. Требуется ELMA365_DOMAIN + ELMA365_TOKEN.`);
+    console.error(
+      `[elma365-mcp] Сервер запущен (stdio). ${TOOL_COUNT} инструментов. `
+      + "Требуется ELMA365_DOMAIN + ELMA365_TOKEN. "
+      + "Инструменты get_widget/get_widget_history/set_widget_script дополнительно требуют ELMA365_DESIGNER_EMAIL + ELMA365_DESIGNER_PASSWORD.",
+    );
   }
 }
 
