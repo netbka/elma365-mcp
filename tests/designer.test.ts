@@ -2,9 +2,10 @@ import { describe, it, expect } from "vitest";
 import { getWidgetSchema, getWidgetHistorySchema, setWidgetScriptSchema } from "../src/tools/designer.js";
 
 // This file locks in schema shape/defaults. designer-safeguards.test.ts
-// exercises the handler through a mocked browser boundary. The README's
-// older live round-trip covers the predecessor; successor safeguards still
-// need fresh real Designer save/validate/publish/revert acceptance evidence.
+// exercises the handler through a mocked browser boundary. Live acceptance
+// of the safeguards (version conflict, save-only, compile-error block,
+// publish, restore) was run 2026-10-07 against a non-production ELMA365
+// 2025.10.97 server — see README "Живая приёмка".
 
 describe("designer tool schemas", () => {
   it("getWidgetSchema requires namespace + code", () => {
