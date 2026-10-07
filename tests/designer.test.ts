@@ -17,6 +17,14 @@ describe("designer tool schemas", () => {
   it("getWidgetHistorySchema defaults size to 10", () => {
     const parsed = getWidgetHistorySchema.parse({ namespace: "ns", code: "widget" });
     expect(parsed.size).toBe(10);
+    expect(parsed.offset).toBe(0);
+  });
+
+  it("getWidgetHistorySchema rejects invalid history offsets", () => {
+    for (const offset of [-1, 0.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => getWidgetHistorySchema.parse({ namespace: "ns", code: "widget", offset })).toThrow();
+    }
+    expect(getWidgetHistorySchema.parse({ namespace: "ns", code: "widget", offset: 50 }).offset).toBe(50);
   });
 
   it("getWidgetHistorySchema rejects size outside 1..50", () => {

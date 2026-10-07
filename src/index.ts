@@ -103,7 +103,7 @@ export function createServer(): McpServer {
 
   server.tool(
     "get_widget_history",
-    "Получить историю публикаций виджета/формы (версии, время, автор, комментарий).",
+    "Получить страницу истории публикаций виджета/формы (версии, время, автор, комментарий). offset задаёт смещение строк; полная страница не доказывает полноту истории.",
     getWidgetHistorySchema.shape,
     async (params) => ({ content: [{ type: "text", text: await handleGetWidgetHistory(params) }] }),
   );
