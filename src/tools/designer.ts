@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { Page } from "playwright";
 import { getPage, designerBaseUrl } from "../designer/session.js";
 
-// These three tools are a different integration than the rest of this
+// These Designer tools are a different integration than the rest of this
 // server: instead of the token-authenticated /pub/v1 REST API, they drive
 // the ELMA365 App Designer through a real (headless) browser session,
 // authenticated with an admin email/password. That's not a design choice —
@@ -24,6 +24,12 @@ export const getWidgetHistorySchema = z.object({
   offset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).default(0)
     .describe("History row offset; request later pages explicitly. A full page does not prove complete history."),
   size: z.number().int().min(1).max(50).default(10),
+});
+
+export const getWidgetVersionSchema = z.object({
+  namespace: z.string().min(1).max(256),
+  code: z.string().min(1).max(256),
+  revisionId: z.string().uuid().describe("Native history row __id from get_widget_history; not an export manifest marker or numeric version"),
 });
 
 export const setWidgetScriptSchema = z.object({
@@ -58,7 +64,7 @@ interface WidgetDescriptor {
 async function fetchWidgetJson(page: Page, namespace: string, code: string): Promise<WidgetDescriptor> {
   return page.evaluate(
     async ({ namespace, code }) => {
-      const res = await fetch(`/api/widgets/get/${namespace}/${code}`, { credentials: "include" });
+      const res = await fetch(`/api/widgets/get/${encodeURIComponent(namespace)}/${encodeURIComponent(code)}`, { credentials: "include" });
       if (!res.ok) throw new Error(`GET widget failed: ${res.status} ${res.statusText}`);
       return res.json();
     },
@@ -168,6 +174,24 @@ export async function handleGetWidgetHistory(params: z.infer<typeof getWidgetHis
   const page = await getPage();
   const json = await fetchHistoryJson(page, params.namespace, params.code, params.offset, params.size);
   return JSON.stringify(json, null, 2);
+}
+
+export async function handleGetWidgetVersion(params: z.infer<typeof getWidgetVersionSchema>): Promise<string> {
+  const page = await getPage();
+  const widget = await fetchWidgetJson(page, params.namespace, params.code);
+  if (typeof widget.__id !== "string" || !widget.__id) throw new Error("Current widget identity is unavailable");
+  const version = await page.evaluate(async (revisionId) => {
+    const res = await fetch(`/api/widgets/version/${encodeURIComponent(revisionId)}`, { credentials: "include" });
+    if (!res.ok) throw new Error(`GET widget version failed: ${res.status} ${res.statusText}`);
+    return res.json();
+  }, params.revisionId);
+  // A revision belongs to one widget. Never attach another object's body or
+  // author merely because the caller supplied a valid native row identifier.
+  if (!version || typeof version !== "object" || version.__id !== params.revisionId
+      || version.widgetId !== widget.__id || !Number.isSafeInteger(version.version) || version.version < 1) {
+    throw new Error("Historical revision identity does not match the requested widget");
+  }
+  return JSON.stringify(version, null, 2);
 }
 
 // Evidence about the one network round-trip a Designer click is supposed to

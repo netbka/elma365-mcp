@@ -12,12 +12,14 @@ import {
   handleGetWidget,
   getWidgetHistorySchema,
   handleGetWidgetHistory,
+  getWidgetVersionSchema,
+  handleGetWidgetVersion,
   setWidgetScriptSchema,
   handleSetWidgetScript,
 } from "./tools/designer.js";
 import { startHttpTransport } from "./transport/http.js";
 
-const TOOL_COUNT = 12;
+const TOOL_COUNT = 13;
 
 export function createServer(): McpServer {
   const server = new McpServer({
@@ -109,6 +111,13 @@ export function createServer(): McpServer {
   );
 
   server.tool(
+    "get_widget_version",
+    "Read a native historical widget/form revision, including descriptor, runtime and native author metadata. revisionId is a history row __id. Checks revision/widget identity; never applies or publishes the revision. Requires Designer session credentials.",
+    getWidgetVersionSchema.shape,
+    async (params) => ({ content: [{ type: "text", text: await handleGetWidgetVersion(params) }] }),
+  );
+
+  server.tool(
     "set_widget_script",
     "Применить локальную правку скрипта (например, из descriptor.clientScripts экспорта elma365pm) к виджету/форме через App Designer: вставка, Сохранить, Проверить и (по умолчанию) Опубликовать. Единственный подтверждённо рабочий способ применить правку скрипта сегодня — elma365pm import/check не работает для EXTENSION-модулей с человекочитаемым кодом, а прямой PUT /api/widgets/{id} требует живой сессионный JWT и lock-hash, которые этот инструмент намеренно не извлекает для повторного использования вне Дизайнера.",
     setWidgetScriptSchema.shape,
@@ -134,7 +143,7 @@ async function main() {
     console.error(
       `[elma365-mcp] Сервер запущен (stdio). ${TOOL_COUNT} инструментов. `
       + "Требуется ELMA365_DOMAIN + ELMA365_TOKEN. "
-      + "Инструменты get_widget/get_widget_history/set_widget_script дополнительно требуют ELMA365_DESIGNER_EMAIL + ELMA365_DESIGNER_PASSWORD.",
+      + "Инструменты get_widget/get_widget_history/get_widget_version/set_widget_script дополнительно требуют ELMA365_DESIGNER_EMAIL + ELMA365_DESIGNER_PASSWORD.",
     );
   }
 }
