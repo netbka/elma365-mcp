@@ -16,6 +16,14 @@ function browser() {
 }
 
 describe("Designer history pages", () => {
+  it("preserves the native versions/count envelope without inferring completeness", async () => {
+    browser();
+    const envelope = { versions: [{ __id: 'synthetic-revision', version: 7 }], count: 85 };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => envelope }));
+    expect(JSON.parse(await handleGetWidgetHistory(getWidgetHistorySchema.parse({ namespace: 'ns', code: 'form', offset: 50 }))))
+      .toEqual(envelope);
+  });
+
   it("requests successive offsets with session credentials and preserves native rows", async () => {
     browser();
     const rows = [{ version: 3, __createdBy: "synthetic-a" }, { version: 2, __createdBy: "synthetic-b" }];
