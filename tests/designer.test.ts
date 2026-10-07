@@ -1,12 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { getWidgetSchema, getWidgetHistorySchema, setWidgetScriptSchema } from "../src/tools/designer.js";
 
-// Full designer tool behavior needs a real Chromium session driving the App
-// Designer UI — not something worth mocking through Playwright's launch
-// chain for a unit test. These tools are instead verified with a live
-// round-trip against a real server (see README.md "Designer tools" for the
-// documented test-and-revert trail). This file just locks in the schemas'
-// shape/defaults so a refactor can't silently drop a required field.
+// This file locks in schema shape/defaults. designer-safeguards.test.ts
+// exercises the handler through a mocked browser boundary. The README's
+// older live round-trip covers the predecessor; successor safeguards still
+// need fresh real Designer save/validate/publish/revert acceptance evidence.
 
 describe("designer tool schemas", () => {
   it("getWidgetSchema requires namespace + code", () => {
