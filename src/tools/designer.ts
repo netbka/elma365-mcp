@@ -31,6 +31,15 @@ export const setWidgetScriptSchema = z.object({
   script: z.string().describe("Full replacement source for descriptor.clientScripts / serverScripts"),
   comment: z.string().optional().describe("Version comment; required by the publish dialog if publish=true"),
   publish: z.boolean().default(true).describe("If false, only Save + Validate; leaves it as an unpublished draft"),
+  expectedVersion: z
+    .number()
+    .int()
+    .optional()
+    .describe(
+      "Optimistic-concurrency guard: if given, the call aborts before touching anything when the widget's " +
+        "current version doesn't match (someone else published in between). Get the current version first via " +
+        "get_widget.",
+    ),
 });
 
 interface WidgetDescriptor {
@@ -132,8 +141,26 @@ export async function handleGetWidgetHistory(params: z.infer<typeof getWidgetHis
   return JSON.stringify(json, null, 2);
 }
 
+// Waits for the real save/validate/publish network round-trip instead of a
+// fixed sleep. All three Designer actions go through a PUT to
+// /api/widgets/{id} (not the /lock heartbeat, which fires continuously in
+// the background regardless of what the user clicks) — see CLAUDE.md's
+// "Widget REST API endpoint map". Falls back to a short grace sleep if no
+// matching response shows up in time, rather than hanging indefinitely on
+// an endpoint-shape guess that turns out to be wrong.
+async function waitForWidgetSave(page: Page, timeoutMs = 8000): Promise<void> {
+  try {
+    await page.waitForResponse(
+      (res) => res.request().method() === "PUT" && res.url().includes("/api/widgets/") && !res.url().endsWith("/lock"),
+      { timeout: timeoutMs },
+    );
+  } catch {
+    await page.waitForTimeout(500);
+  }
+}
+
 export async function handleSetWidgetScript(params: z.infer<typeof setWidgetScriptSchema>): Promise<string> {
-  const { namespace, code, scriptType, script, comment, publish } = params;
+  const { namespace, code, scriptType, script, comment, publish, expectedVersion } = params;
   const page = await getPage();
 
   // Conflict guard: compare against current state before touching anything.
@@ -142,6 +169,17 @@ export async function handleSetWidgetScript(params: z.infer<typeof setWidgetScri
   // published version — so matching content alone isn't reason enough to
   // skip if that draft still needs to be published.
   const before = await fetchWidgetJson(page, namespace, code);
+
+  if (expectedVersion !== undefined && before.version !== expectedVersion) {
+    return JSON.stringify({
+      success: false,
+      reason: `Version conflict: widget is at version ${before.version}, expected ${expectedVersion}. ` +
+        "Someone else likely published in between — re-fetch with get_widget before retrying.",
+      version: before.version,
+      draft: before.draft,
+    });
+  }
+
   const currentScript = scriptType === "server" ? before.descriptor?.serverScripts : before.descriptor?.clientScripts;
   const alreadyInDesiredState = currentScript === script && (!publish || !before.draft);
   if (alreadyInDesiredState) {
@@ -158,10 +196,10 @@ export async function handleSetWidgetScript(params: z.infer<typeof setWidgetScri
   await pasteIntoEditor(page, scriptType, script);
 
   await page.getByRole("button", { name: "Сохранить" }).click();
-  await page.waitForTimeout(300);
+  await waitForWidgetSave(page);
 
   await page.getByRole("button", { name: "check Проверить" }).click();
-  await page.waitForTimeout(500);
+  await waitForWidgetSave(page);
 
   // If validation failed, the Опубликовать button stays disabled.
   const publishButton = page.getByRole("button", { name: "arrow_from_bottom Опубликовать" });
@@ -174,7 +212,18 @@ export async function handleSetWidgetScript(params: z.infer<typeof setWidgetScri
   }
 
   if (!publish) {
-    return JSON.stringify({ success: true, published: false, note: "Saved + validated only, left as unpublished draft (publish=false)." });
+    // Confirm the save actually landed rather than trusting the click.
+    const savedState = await fetchWidgetJson(page, namespace, code);
+    const savedScript = scriptType === "server" ? savedState.descriptor?.serverScripts : savedState.descriptor?.clientScripts;
+    if (savedScript !== script) {
+      return JSON.stringify({
+        success: false,
+        reason: "Save did not take effect: re-fetched draft content does not match what was pasted.",
+        version: savedState.version,
+        draft: savedState.draft,
+      });
+    }
+    return JSON.stringify({ success: true, published: false, version: savedState.version, draft: savedState.draft, note: "Saved + validated only, left as unpublished draft (publish=false)." });
   }
 
   await publishButton.click();
@@ -187,8 +236,23 @@ export async function handleSetWidgetScript(params: z.infer<typeof setWidgetScri
     await dialog.getByRole("textbox").first().fill(comment);
   }
   await dialog.getByRole("button", { name: "Опубликовать", exact: true }).click();
-  await page.waitForTimeout(1000);
+  await waitForWidgetSave(page);
 
+  // Confirm the publish actually took effect — don't trust the click alone.
+  // Compare the full published text and require draft:false, not just a
+  // version bump (a version bump alone doesn't prove the *content* landed).
   const after = await fetchWidgetJson(page, namespace, code);
+  const publishedScript = scriptType === "server" ? after.descriptor?.serverScripts : after.descriptor?.clientScripts;
+  if (after.draft !== false || publishedScript !== script) {
+    return JSON.stringify({
+      success: false,
+      reason: "Publish click completed but re-fetched state doesn't confirm it: " +
+        (after.draft !== false ? "widget is still a draft. " : "") +
+        (publishedScript !== script ? "published content does not match what was sent." : ""),
+      version: after.version,
+      draft: after.draft,
+    });
+  }
+
   return JSON.stringify({ success: true, published: true, version: after.version, draft: after.draft });
 }
