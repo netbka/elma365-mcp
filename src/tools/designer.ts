@@ -21,6 +21,8 @@ export const getWidgetSchema = z.object({
 export const getWidgetHistorySchema = z.object({
   namespace: z.string(),
   code: z.string(),
+  offset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).default(0)
+    .describe("History row offset; request later pages explicitly. A full page does not prove complete history."),
   size: z.number().int().min(1).max(50).default(10),
 });
 
@@ -64,14 +66,14 @@ async function fetchWidgetJson(page: Page, namespace: string, code: string): Pro
   );
 }
 
-async function fetchHistoryJson(page: Page, namespace: string, code: string, size: number): Promise<unknown> {
+async function fetchHistoryJson(page: Page, namespace: string, code: string, offset: number, size: number): Promise<unknown> {
   return page.evaluate(
-    async ({ namespace, code, size }) => {
-      const res = await fetch(`/api/widgets/history/${namespace}/${code}/0/${size}`, { credentials: "include" });
+    async ({ namespace, code, offset, size }) => {
+      const res = await fetch(`/api/widgets/history/${encodeURIComponent(namespace)}/${encodeURIComponent(code)}/${offset}/${size}`, { credentials: "include" });
       if (!res.ok) throw new Error(`GET history failed: ${res.status} ${res.statusText}`);
       return res.json();
     },
-    { namespace, code, size },
+    { namespace, code, offset, size },
   );
 }
 
@@ -164,7 +166,7 @@ export async function handleGetWidget(params: z.infer<typeof getWidgetSchema>): 
 
 export async function handleGetWidgetHistory(params: z.infer<typeof getWidgetHistorySchema>): Promise<string> {
   const page = await getPage();
-  const json = await fetchHistoryJson(page, params.namespace, params.code, params.size);
+  const json = await fetchHistoryJson(page, params.namespace, params.code, params.offset, params.size);
   return JSON.stringify(json, null, 2);
 }
 
