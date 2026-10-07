@@ -43,6 +43,7 @@ export const setWidgetScriptSchema = z.object({
 });
 
 interface WidgetDescriptor {
+  __id: string;
   version: number;
   draft: boolean;
   descriptor?: {
@@ -80,19 +81,45 @@ async function openDesigner(page: Page, namespace: string, code: string): Promis
   await page.getByRole("link", { name: "Скрипты" }).click();
 }
 
-async function pasteIntoEditor(page: Page, scriptType: "client" | "server", code: string): Promise<void> {
-  if (scriptType === "server") {
-    await page.getByRole("radio", { name: "Сервер" }).check();
-  } else {
-    await page.getByRole("radio", { name: "Клиент" }).check();
+// The Клиент/Сервер switch on the Скрипты tab is a pair of radios on ELMA365
+// 2025.4 and a pair of aria-pressed toggle buttons (inside a group) on
+// 2025.10 — observed live on dev2 after its 2025.4.107 → 2025.10.97 upgrade.
+// Support both so one build works against either server generation.
+async function selectScriptKind(page: Page, scriptType: "client" | "server"): Promise<void> {
+  const label = scriptType === "server" ? "Сервер" : "Клиент";
+  const radio = page.getByRole("radio", { name: label });
+  if ((await radio.count()) > 0) {
+    await radio.check();
+    return;
   }
+  const toggle = page.getByRole("button", { name: label, exact: true }).first();
+  await toggle.waitFor({ state: "visible", timeout: 10000 });
+  if ((await toggle.getAttribute("aria-pressed")) !== "true") {
+    await toggle.click();
+  }
+}
+
+async function pasteIntoEditor(page: Page, scriptType: "client" | "server", code: string): Promise<void> {
+  // The editor (and the switch next to it) only exists once the Скрипты tab
+  // has rendered — wait for a Monaco line before looking for the switch.
+  const line = page.locator(".view-line").first();
+  await line.waitFor({ state: "visible", timeout: 10000 });
+  await selectScriptKind(page, scriptType);
+  await line.waitFor({ state: "visible", timeout: 10000 });
 
   await page.evaluate((text) => navigator.clipboard.writeText(text), code);
 
-  const line = page.locator(".view-line").first();
-  await line.waitFor({ state: "visible", timeout: 10000 });
-  const box = await line.boundingBox();
-  if (!box) throw new Error("Could not resolve editor line bounding box");
+  // Monaco re-creates .view-line nodes while it (re)renders, so a single
+  // boundingBox() on a line can come back null right after a tab switch.
+  // The .view-lines container is stable; clicking its top-left focuses the
+  // editor just the same. The real <textarea> is covered by an overlay and
+  // won't take a normal element click.
+  let box: { x: number; y: number } | null = null;
+  for (let attempt = 0; attempt < 10 && !box; attempt++) {
+    box = await page.locator(".view-lines").first().boundingBox();
+    if (!box) await page.waitForTimeout(300);
+  }
+  if (!box) throw new Error("Could not resolve editor bounding box");
   await page.mouse.click(box.x + 5, box.y + 5);
   await page.keyboard.press("Control+a");
   await page.keyboard.press("Control+v");
@@ -141,27 +168,72 @@ export async function handleGetWidgetHistory(params: z.infer<typeof getWidgetHis
   return JSON.stringify(json, null, 2);
 }
 
-// Waits for the real save/validate/publish network round-trip instead of a
-// fixed sleep. All three Designer actions go through a PUT to
-// /api/widgets/{id} (not the /lock heartbeat, which fires continuously in
-// the background regardless of what the user clicks) — see CLAUDE.md's
-// "Widget REST API endpoint map". Falls back to a short grace sleep if no
-// matching response shows up in time, rather than hanging indefinitely on
-// an endpoint-shape guess that turns out to be wrong.
-async function waitForWidgetSave(page: Page, timeoutMs = 8000): Promise<void> {
-  try {
-    await page.waitForResponse(
-      (res) => res.request().method() === "PUT" && res.url().includes("/api/widgets/") && !res.url().endsWith("/lock"),
-      { timeout: timeoutMs },
-    );
-  } catch {
-    await page.waitForTimeout(500);
-  }
+// Evidence about the one network round-trip a Designer click is supposed to
+// cause. `timedOut` means no matching response arrived within the window —
+// the caller then has to decide from a content readback, never from the click.
+export interface AwaitedResponse {
+  status: number | null;
+  ok: boolean;
+  timedOut: boolean;
+  path: string | null;
+  /** Compact summary of the response body: `{version, draft}` for a widget PUT, `{errors}` for compile. */
+  body?: Record<string, unknown>;
 }
+
+interface CompileError { path?: string; desc?: string; level?: string }
+
+type ResponseLike = {
+  url(): string;
+  status(): number;
+  ok(): boolean;
+  json(): Promise<unknown>;
+  request(): { method(): string };
+};
+
+function summarizeBody(path: string, json: unknown): Record<string, unknown> | undefined {
+  if (!json || typeof json !== "object") return undefined;
+  const j = json as Record<string, any>;
+  if (path.endsWith("/compile")) return { errors: Array.isArray(j.errors) ? j.errors : [] };
+  const w = j.widget ?? j;
+  if (w && typeof w === "object" && "version" in w) return { version: w.version, draft: w.draft };
+  return undefined;
+}
+
+// Clicks a Designer control and awaits the specific request that click is
+// expected to cause. The listener is armed *before* the click (a fast
+// response otherwise lands before `waitForResponse` is even installed and
+// the wait silently times out), the predicate is pinned to this widget's
+// own id (the /lock heartbeat and other widgets' traffic never match), and
+// the HTTP status is returned instead of being swallowed. Save and Publish
+// are both a `PUT /api/widgets/{widgetId}` — see CLAUDE.md's "Widget REST
+// API endpoint map"; Проверить is a `POST /api/widgets/compile`.
+async function clickAndAwait(
+  page: Page,
+  click: () => Promise<void>,
+  expected: { method: string; path: string },
+  timeoutMs = 15000,
+): Promise<AwaitedResponse> {
+  const matches = (res: ResponseLike) =>
+    res.request().method() === expected.method && new URL(res.url()).pathname === expected.path;
+  const response = page.waitForResponse(matches, { timeout: timeoutMs }).then(
+    async (res) => {
+      const path = new URL(res.url()).pathname;
+      const body = summarizeBody(path, await res.json().catch(() => undefined));
+      return { status: res.status(), ok: res.ok(), timedOut: false, path, ...(body ? { body } : {}) };
+    },
+    () => ({ status: null, ok: false, timedOut: true, path: null }),
+  );
+  await click();
+  return response;
+}
+
+const widgetPut = (widgetId: string) => ({ method: "PUT", path: `/api/widgets/${widgetId}` });
+const widgetCompile = { method: "POST", path: "/api/widgets/compile" };
 
 export async function handleSetWidgetScript(params: z.infer<typeof setWidgetScriptSchema>): Promise<string> {
   const { namespace, code, scriptType, script, comment, publish, expectedVersion } = params;
   const page = await getPage();
+  const scriptOf = (w: WidgetDescriptor) => (scriptType === "server" ? w.descriptor?.serverScripts : w.descriptor?.clientScripts);
 
   // Conflict guard: compare against current state before touching anything.
   // Note: GET .../widgets/get returns an unpublished DRAFT's content (with
@@ -180,8 +252,7 @@ export async function handleSetWidgetScript(params: z.infer<typeof setWidgetScri
     });
   }
 
-  const currentScript = scriptType === "server" ? before.descriptor?.serverScripts : before.descriptor?.clientScripts;
-  const alreadyInDesiredState = currentScript === script && (!publish || !before.draft);
+  const alreadyInDesiredState = scriptOf(before) === script && (!publish || !before.draft);
   if (alreadyInDesiredState) {
     return JSON.stringify({
       success: true,
@@ -192,67 +263,113 @@ export async function handleSetWidgetScript(params: z.infer<typeof setWidgetScri
     });
   }
 
+  const widgetId = before.__id;
+  const network: { save?: AwaitedResponse; validate?: AwaitedResponse; publish?: AwaitedResponse } = {};
+
   await openDesigner(page, namespace, code);
   await pasteIntoEditor(page, scriptType, script);
 
-  await page.getByRole("button", { name: "Сохранить" }).click();
-  await waitForWidgetSave(page);
-
-  await page.getByRole("button", { name: "check Проверить" }).click();
-  await waitForWidgetSave(page);
-
-  // If validation failed, the Опубликовать button stays disabled.
-  const publishButton = page.getByRole("button", { name: "arrow_from_bottom Опубликовать" });
-  const isDisabled = await publishButton.isDisabled().catch(() => true);
-  if (isDisabled) {
+  network.save = await clickAndAwait(page, () => page.getByRole("button", { name: "Сохранить" }).click(), widgetPut(widgetId));
+  if (network.save.status !== null && !network.save.ok) {
     return JSON.stringify({
       success: false,
-      reason: "Validation failed or left Опубликовать disabled — check the Designer UI for the error banner.",
+      reason: `Save request failed: PUT ${network.save.path} returned HTTP ${network.save.status}.`,
+      version: before.version,
+      draft: before.draft,
+      network,
+    });
+  }
+
+  // Confirm the save actually landed rather than trusting the click or even
+  // the PUT status: the server-side draft must now carry exactly this text.
+  // This is also the fallback when the PUT wait timed out.
+  const saved = await fetchWidgetJson(page, namespace, code);
+  if (scriptOf(saved) !== script) {
+    return JSON.stringify({
+      success: false,
+      reason: "Save did not take effect: re-fetched draft content does not match what was pasted." +
+        (network.save.timedOut ? " No PUT for this widget was observed within the wait window." : ""),
+      version: saved.version,
+      draft: saved.draft,
+      network,
+    });
+  }
+
+  network.validate = await clickAndAwait(page, () => page.getByRole("button", { name: "check Проверить" }).click(), widgetCompile);
+
+  // Validation verdict comes from the compile response itself. On ELMA365
+  // 2025.10 the Опубликовать button stays enabled and the publish dialog
+  // opens even when Проверить reported compile errors (observed live on
+  // dev2, 2026-10-07) — so the button state alone is not a safeguard. A
+  // disabled button (older UI) is still honoured as an additional signal.
+  const compileErrors = ((network.validate.body?.errors as CompileError[] | undefined) ?? []).filter(
+    (e) => e.level !== "warning",
+  );
+  const publishButton = page.getByRole("button", { name: "arrow_from_bottom Опубликовать" });
+  const isDisabled = await publishButton.isDisabled().catch(() => true);
+  if (network.validate.timedOut || !network.validate.ok || compileErrors.length > 0 || isDisabled) {
+    return JSON.stringify({
+      success: false,
+      reason:
+        (compileErrors.length > 0
+          ? `Validation (Проверить) reported ${compileErrors.length} error(s). `
+          : network.validate.timedOut
+            ? "No compile response was observed for Проверить within the wait window. "
+            : !network.validate.ok
+              ? `Compile request returned HTTP ${network.validate.status}. `
+              : "Опубликовать is disabled after Проверить. ") +
+        "Nothing was published; the pasted text remains an unpublished draft and the published version is unchanged.",
+      errors: compileErrors.map((e) => `${e.path ?? ""} ${e.desc ?? ""}`.trim()),
+      version: saved.version,
+      draft: saved.draft,
+      network,
     });
   }
 
   if (!publish) {
-    // Confirm the save actually landed rather than trusting the click.
-    const savedState = await fetchWidgetJson(page, namespace, code);
-    const savedScript = scriptType === "server" ? savedState.descriptor?.serverScripts : savedState.descriptor?.clientScripts;
-    if (savedScript !== script) {
-      return JSON.stringify({
-        success: false,
-        reason: "Save did not take effect: re-fetched draft content does not match what was pasted.",
-        version: savedState.version,
-        draft: savedState.draft,
-      });
-    }
-    return JSON.stringify({ success: true, published: false, version: savedState.version, draft: savedState.draft, note: "Saved + validated only, left as unpublished draft (publish=false)." });
+    return JSON.stringify({
+      success: true,
+      published: false,
+      version: saved.version,
+      draft: saved.draft,
+      note: "Saved + validated only, left as unpublished draft (publish=false).",
+      network,
+    });
   }
 
   await publishButton.click();
   // Two nested elements carry role="dialog" here (an outer wrapper plus the
-  // real PrimeNG dialog) — match on the accessible name ("Версия <n>") to
-  // land on the inner one instead of a Playwright strict-mode violation.
-  const dialog = page.getByRole("dialog", { name: /Версия/ });
+  // real PrimeNG dialog). On 2025.4 the inner one had the accessible name
+  // "Версия <n>"; on 2025.10 neither has a name and "Версия <n>" is plain
+  // text inside — so match on contained text and take the innermost one
+  // instead of a Playwright strict-mode violation.
+  const dialog = page.getByRole("dialog").filter({ hasText: /Версия/ }).last();
   await dialog.waitFor({ state: "visible", timeout: 10000 });
   if (comment) {
     await dialog.getByRole("textbox").first().fill(comment);
   }
-  await dialog.getByRole("button", { name: "Опубликовать", exact: true }).click();
-  await waitForWidgetSave(page);
+  network.publish = await clickAndAwait(
+    page,
+    () => dialog.getByRole("button", { name: "Опубликовать", exact: true }).click(),
+    widgetPut(widgetId),
+  );
 
   // Confirm the publish actually took effect — don't trust the click alone.
   // Compare the full published text and require draft:false, not just a
   // version bump (a version bump alone doesn't prove the *content* landed).
   const after = await fetchWidgetJson(page, namespace, code);
-  const publishedScript = scriptType === "server" ? after.descriptor?.serverScripts : after.descriptor?.clientScripts;
-  if (after.draft !== false || publishedScript !== script) {
+  if (after.draft !== false || scriptOf(after) !== script) {
     return JSON.stringify({
       success: false,
       reason: "Publish click completed but re-fetched state doesn't confirm it: " +
         (after.draft !== false ? "widget is still a draft. " : "") +
-        (publishedScript !== script ? "published content does not match what was sent." : ""),
+        (scriptOf(after) !== script ? "published content does not match what was sent." : "") +
+        (network.publish.timedOut ? " No PUT for this widget was observed within the wait window." : ""),
       version: after.version,
       draft: after.draft,
+      network,
     });
   }
 
-  return JSON.stringify({ success: true, published: true, version: after.version, draft: after.draft });
+  return JSON.stringify({ success: true, published: true, version: after.version, draft: after.draft, network });
 }
